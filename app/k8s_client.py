@@ -41,6 +41,18 @@ def _deploy_path(namespace: str, name: str) -> str:
     return f"/apis/apps/v1/namespaces/{namespace}/deployments/{name}"
 
 
+def _pod_path(namespace: str, name: str) -> str:
+    return f"/api/v1/namespaces/{namespace}/pods/{name}"
+
+
+def _rs_path(namespace: str, name: str) -> str:
+    return f"/apis/apps/v1/namespaces/{namespace}/replicasets/{name}"
+
+
+def _slice_path(namespace: str) -> str:
+    return f"/apis/discovery.k8s.io/v1/namespaces/{namespace}/endpointslices"
+
+
 def _request(method: str, path: str, **kwargs) -> dict[str, Any]:
     try:
         resp = httpx.request(method, _base() + path, timeout=_timeout(), **kwargs)
@@ -73,6 +85,23 @@ def get_service(namespace: str, name: str) -> dict[str, Any]:
 
 def get_deployment(namespace: str, name: str) -> dict[str, Any]:
     return _request("GET", _deploy_path(namespace, name))
+
+
+def get_pod(namespace: str, name: str) -> dict[str, Any]:
+    return _request("GET", _pod_path(namespace, name))
+
+
+def get_replicaset(namespace: str, name: str) -> dict[str, Any]:
+    return _request("GET", _rs_path(namespace, name))
+
+
+def list_endpointslices(namespace: str, label_selector: str | None = None) -> list[dict[str, Any]]:
+    params = {"labelSelector": label_selector} if label_selector else None
+    return _request("GET", _slice_path(namespace), params=params).get("items", [])
+
+
+def get_endpointslice(namespace: str, name: str) -> dict[str, Any]:
+    return _request("GET", f"{_slice_path(namespace)}/{name}")
 
 
 def delete_service(namespace: str, name: str) -> dict[str, Any]:

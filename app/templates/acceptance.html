@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>验收就绪检查 · {{ namespace }}</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --text:#e2e8f0; --muted:#94a3b8;
+          --blue:#38bdf8; --red:#f87171; --amber:#fbbf24; --green:#4ade80; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+         background:var(--bg); color:var(--text); line-height:1.5; }
+  header { padding:20px 28px; border-bottom:1px solid var(--line); display:flex;
+           align-items:baseline; gap:16px; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:20px; }
+  header .meta { color:var(--muted); font-size:13px; }
+  header a { color:var(--blue); font-size:13px; }
+  main { padding:24px 28px; max-width:1180px; margin:0 auto; }
+  .error-banner { background:#7f1d1d; border:1px solid var(--red); color:#fecaca;
+                  padding:10px 14px; border-radius:8px; margin-bottom:18px; font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          margin-bottom:18px; overflow:hidden; }
+  .card h2 { margin:0; padding:14px 18px; font-size:16px; border-bottom:1px solid var(--line);
+             display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
+  .branch { color:var(--blue); font-family: ui-monospace, monospace; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:9px 18px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  td.mono, code { font-family: ui-monospace, Menlo, monospace; font-size:12px; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px;
+           border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+  .badge.acceptable { color:var(--green); border-color:var(--green); background:#052e16; }
+  .badge.pending { color:var(--amber); border-color:var(--amber); background:#451a03; }
+  .badge.blocked { color:var(--red); border-color:var(--red); background:#450a0a; }
+  .badge.unsupported { color:var(--muted); }
+  .check-ok { color:var(--green); }
+  .check-bad { color:var(--red); }
+  .check-unknown { color:var(--amber); }
+  .verdict-box { padding:12px 18px; border-bottom:1px solid var(--line); font-size:13.5px; }
+  .verdict-box.acceptable { background:#052e16; }
+  .verdict-box.pending { background:#451a03; }
+  .verdict-box.blocked { background:#450a0a; }
+  .section { padding:10px 18px; border-bottom:1px solid var(--line); }
+  .section h3 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:600; }
+  .muted { color:var(--muted); }
+  .hint { font-size:12px; color:var(--muted); margin-top:6px; }
+  ul.checks { margin:0; padding-left:18px; font-size:12.5px; }
+  form.inline { display:inline; }
+  button { background:var(--blue); color:#082f49; border:0; border-radius:7px; padding:6px 12px;
+           font-size:13px; font-weight:600; cursor:pointer; }
+  .stale { color:var(--amber); }
+</style>
+</head>
+<body id="top">
+<header>
+  <h1>验收就绪检查</h1>
+  <span class="meta">命名空间 <code>{{ namespace }}</code> · 分支标签 <code>{{ branch_label }}</code></span>
+  <a href="/">← 返回清理控制台</a>
+</header>
+<main>
+  {% if request.query_params.get("error") %}
+  <div class="error-banner">⚠ {{ request.query_params.get("error") }}</div>
+  {% endif %}
+  {% if api_error %}
+  <div class="error-banner">⚠ {{ api_error }}</div>
+  {% endif %}
+
+  <p class="hint">
+    只检查同命名空间内 <strong>type=ClusterIP、使用默认流量策略、未开启 publishNotReadyAddresses</strong> 的 Service。
+    可验收需同时成立：Deployment 控制器已观察当前 generation；EndpointSlice 至少有一个 ready 且未终止的端点；
+    每个就绪端点都能按 UID 经 Pod → ReplicaSet 追到该 Deployment 的<strong>当前 Pod 模板</strong>。
+    读取失败、判定期间状态变化或就绪/归属缺少证据时显示“待核实”。判定结果对应检查期间的同一个集群状态。
+  </p>
+
+  {% if not backends %}
+  <p class="muted">命名空间内没有可检查的 Service。</p>
+  {% endif %}
+
+  {% for g in backends %}
+  {% set r = results.get(g.branch) %}
+  <div class="card" id="branch-{{ g.branch }}">
+    <h2>
+      <span>分支 <span class="branch">{{ g.branch }}</span>
+        {% if r %}<span class="badge {{ r.verdict }}">{{ verdict_labels.get(r.verdict, r.verdict) }}</span>
+        {% else %}<span class="badge">未检查</span>{% endif %}
+      </span>
+      <form class="inline" method="post" action="/acceptance/check">
+        <input type="hidden" name="branch" value="{{ g.branch }}">
+        <button type="submit">运行验收检查</button>
+      </form>
+    </h2>
+
+    <table>
+      <tr><th style="width:170px">Service</th><td class="mono">{{ g.service.name }}</td></tr>
+      <tr><th>分支</th><td class="mono">{{ g.branch }}</td></tr>
+      <tr><th>Deployment</th><td class="mono">{{ g.deployment.name if g.deployment else "—（同分支未找到唯一 Deployment）" }}
+        {% if r and r.deployment_uid %}<span class="muted">（UID {{ r.deployment_uid }}）</span>{% endif %}
+      </td></tr>
+    </table>
+
+    {% if r %}
+    <div class="verdict-box {{ r.verdict }}">
+      <strong>{{ r.verdict_label }}</strong> · {{ r.detail }}
+      {% if r.checked_at %}<div class="hint">判定时间 {{ r.checked_at }}</div>{% endif %}
+    </div>
+
+    <div class="section">
+      <h3>判定依据（检查期间一致状态）</h3>
+      <ul class="checks">
+        {% for c in r.checks %}
+        <li>
+          {% if c.ok is true %}<span class="check-ok">✔</span>
+          {% elif c.ok is false %}<span class="check-bad">✘</span>
+          {% else %}<span class="check-unknown">•</span>{% endif %}
+          {{ c.name }}{% if c.detail %} — <span class="muted">{{ c.detail }}</span>{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% if r.read_epoch %}
+      <p class="hint">
+        一致性快照：Deployment rv <code>{{ r.read_epoch.deploymentResourceVersion }}</code> ·
+        Service rv <code>{{ r.read_epoch.serviceResourceVersion }}</code> ·
+        EndpointSlice {{ r.read_epoch.slices | length }} 个 ·
+        Pod {{ r.read_epoch.pods | default({}) | length }} 个 ·
+        ReplicaSet {{ r.read_epoch.replicaSets | default({}) | length }} 个
+        {% if r.read_epoch.consistent %}<span class="check-ok">（复核未变化）</span>
+        {% else %}<span class="check-bad">（复核发现变化）</span>{% endif %}
+      </p>
+      {% endif %}
+    </div>
+
+    {% if r.problems %}
+    <div class="section">
+      <h3>待核实原因</h3>
+      <ul class="checks">
+        {% for p in r.problems %}<li class="check-unknown">{{ p }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <div class="section">
+      <h3>端点明细</h3>
+      {% if r.endpoints %}
+      <table>
+        <thead><tr>
+          <th>地址</th><th>就绪</th><th>未终止</th><th>Pod</th><th>ReplicaSet</th>
+          <th>归属</th><th>证据</th>
+        </tr></thead>
+        <tbody>
+        {% for ep in r.endpoints %}
+        <tr>
+          <td class="mono">{{ ep.address }}</td>
+          <td>{{ "✔" if ep.ready is true else ("✘" if ep.ready is false else "?") }}</td>
+          <td>{{ "✔" if not ep.terminating else "✘" }}</td>
+          <td class="mono">{{ ep.pod_name or "—" }}</td>
+          <td class="mono">{{ ep.replicaset or "—" }}</td>
+          <td>
+            {% if ep.kind == "current" %}<span class="badge acceptable">当前模板</span>
+            {% elif ep.kind == "stale" %}<span class="badge pending">旧版</span>
+            {% elif ep.kind == "other" %}<span class="badge blocked">其他 Deployment</span>
+            {% else %}<span class="badge">未确认</span>{% endif %}
+          </td>
+          <td class="muted">{{ ep.evidence }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="muted">没有端点记录。</p>
+      {% endif %}
+    </div>
+
+    {% if r.stale_endpoints %}
+    <div class="section">
+      <h3>仍就绪且未终止的旧版 / 其他分支端点</h3>
+      <ul class="checks stale">
+        {% for ep in r.stale_endpoints %}
+        <li class="stale">{{ ep.address }} · Pod <code>{{ ep.pod_name }}</code> · {{ ep.evidence }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  <p class="hint">
+    “待核实”包含：API 读取失败、判定前后 resourceVersion 变化、端点 ready 不是布尔值、
+    targetRef 缺失/UID 不符、Pod 或 ReplicaSet 读不到、owner 链断裂、缺少 Pod 模板。
+    这些情况工具不会猜测结论。旧版端点的识别依据是 ReplicaSet 的 spec.template 与
+    Deployment 当前 spec.template 是否一致。
+  </p>
+</main>
+</body>
+</html>

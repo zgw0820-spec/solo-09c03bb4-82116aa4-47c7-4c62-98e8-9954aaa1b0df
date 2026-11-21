@@ -2,26 +2,35 @@
 
 页面：
   GET /                按分支列出同一命名空间内成对的 Service / Deployment 及清理任务
+  GET /acceptance      滚动发布后，检查原 Service 能否用于验收新版
+  GET /acceptance/check 对指定分支重新判定（303 回 /acceptance）
   POST /confirm        确认清理：现场核对身份后保存清单快照
   POST /jobs/{id}/run  沿清单执行/继续一次清理
   POST /jobs/{id}/resolve 冲突后人工确认，刷新清单基线
 
-设计约束见 cleanup.py；本文件只做 HTTP 编排与展示。
+设计约束见 cleanup.py / acceptance.py；本文件只做 HTTP 编排与展示。
 """
 from __future__ import annotations
 
 import os
+import threading
+from datetime import datetime, timezone
+from urllib.parse import quote
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from . import cleanup, k8s_client, store
+from . import acceptance, cleanup, k8s_client, store
 
 NAMESPACE = os.environ.get("NAMESPACE", "previews")
 
 app = FastAPI(title="Preview Environment Cleaner")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+
+# 最近一次验收判定结果（仅内存缓存，供页面展示；判定只由显式检查触发）
+_ACCEPTANCE_LOCK = threading.Lock()
+_LAST_ACCEPTANCE: dict[str, acceptance.AcceptanceResult] = {}
 
 PHASE_LABELS = {
     "confirmed": "已确认待清理",
@@ -103,6 +112,131 @@ def index(request: Request) -> HTMLResponse:
     })
 
 
+@app.get("/acceptance", response_class=HTMLResponse)
+def acceptance_page(request: Request) -> HTMLResponse:
+    """分支页：展示最近一次判定结果。
+
+    页面本身不重新判定（避免刷新即改状态）；结果只来自显式“运行验收检查”
+    或 /api/acceptance 的现场读取，并带判定期间的一致性快照。
+    """
+    groups, api_error = _group_inventory()
+    with _ACCEPTANCE_LOCK:
+        results = {branch: res for branch, res in _LAST_ACCEPTANCE.items()}
+    backends = [g for g in groups if g.get("service")]
+    return templates.TemplateResponse(request, "acceptance.html", {
+        "namespace": NAMESPACE,
+        "branch_label": k8s_client.BRANCH_LABEL,
+        "backends": backends,
+        "results": results,
+        "verdict_labels": acceptance.VERDICT_LABELS,
+        "api_error": api_error,
+    })
+
+
+def _run_acceptance(branch: str) -> acceptance.AcceptanceResult:
+    """现场判定一个分支的 Service。任何读取失败都归入“待核实”，不猜测结论。"""
+    def pending(service_name: str, reason: str) -> acceptance.AcceptanceResult:
+        res = acceptance.AcceptanceResult(
+            verdict=acceptance.VERDICT_PENDING,
+            service_name=service_name,
+            detail=reason,
+            checked_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        res.problems.append(reason)
+        return res
+
+    try:
+        services = k8s_client.list_services(NAMESPACE)
+        deployments = k8s_client.list_deployments(NAMESPACE)
+    except k8s_client.K8sOperationError as exc:
+        return pending("—", f"读取命名空间对象失败，无法给出判定：{exc}")
+
+    candidates = [s for s in services
+                  if (k8s_client.branch_of(s) or "(无分支标签)") == branch]
+    if not candidates:
+        return pending("—", f"分支 {branch} 在该命名空间内没有 Service")
+    if len(candidates) > 1:
+        # 不猜测：多 Service 时并为待核实
+        return pending(
+            ", ".join(s["metadata"]["name"] for s in candidates),
+            f"分支 {branch} 有 {len(candidates)} 个 Service，无法确定验收对象")
+
+    svc = candidates[0]
+    # 逐条重读，避免用列表缓存里的旧快照做判定
+    try:
+        svc = k8s_client.get_service(NAMESPACE, svc["metadata"]["name"])
+    except k8s_client.K8sNotFound:
+        return pending(svc["metadata"]["name"], "Service 在判定期间消失，状态不一致")
+    except k8s_client.K8sOperationError as exc:
+        return pending(svc["metadata"]["name"], f"读取 Service 失败：{exc}")
+
+    if not acceptance.default_policy(svc)[0]:
+        return acceptance.evaluate(svc, None, NAMESPACE)
+
+    dep = acceptance.find_deployment_for_service(svc, deployments, services)
+    if dep is not None:
+        try:
+            dep = k8s_client.get_deployment(NAMESPACE, dep["metadata"]["name"])
+        except k8s_client.K8sOperationError as exc:
+            # Deployment 读不到 → 待核实，但仍判定 Service 本身
+            res = acceptance.evaluate(svc, None, NAMESPACE)
+            res.problems.append(f"读取 Deployment 失败：{exc}")
+            res.detail = "；".join(res.problems)
+            return res
+    return acceptance.evaluate(svc, dep, NAMESPACE)
+
+
+@app.post("/acceptance/check")
+def acceptance_check(branch: str = Form(...)) -> RedirectResponse:
+    res = _run_acceptance(branch)
+    with _ACCEPTANCE_LOCK:
+        _LAST_ACCEPTANCE[branch] = res
+    return RedirectResponse(f"/acceptance#branch-{quote(branch)}", status_code=303)
+
+
+@app.get("/api/acceptance")
+def api_acceptance(branch: str | None = None) -> JSONResponse:
+    """现场判定并以 JSON 返回（branch 缺省则判定全部有 Service 的分支）。"""
+    try:
+        services = k8s_client.list_services(NAMESPACE)
+        list_error = None
+    except k8s_client.K8sOperationError as exc:
+        services = []
+        list_error = f"无法读取 Service 列表：{exc}"
+
+    if list_error:
+        branches = [branch] if branch else ["(未知)"]
+    else:
+        branches = [branch] if branch else sorted({
+            k8s_client.branch_of(s) or "(无分支标签)" for s in services})
+
+    out = []
+    for b in branches:
+        res = _run_acceptance(b)
+        if list_error:
+            res.problems.insert(0, list_error)
+            res.detail = "；".join(res.problems)
+            res.verdict = acceptance.VERDICT_PENDING
+        with _ACCEPTANCE_LOCK:
+            _LAST_ACCEPTANCE[b] = res
+        out.append({
+            "branch": b,
+            "verdict": res.verdict,
+            "verdictLabel": res.verdict_label,
+            "detail": res.detail,
+            "service": res.service_name,
+            "deployment": res.deployment_name,
+            "checks": res.checks,
+            "problems": res.problems,
+            "readEpoch": res.read_epoch,
+            "checkedAt": res.checked_at,
+            "endpoints": [r.__dict__ | {"readyAndLive": r.ready_and_live}
+                          for r in res.endpoints],
+            "staleEndpoints": [r.__dict__ for r in res.stale_endpoints],
+        })
+    return JSONResponse({"namespace": NAMESPACE, "branches": out})
+
+
 @app.post("/confirm")
 def confirm(branch: str = Form(...), service_name: str = Form(...),
             deployment_name: str = Form(...)) -> RedirectResponse:
@@ -165,7 +299,6 @@ def api_inventory() -> JSONResponse:
     return JSONResponse({"namespace": NAMESPACE, "groups": groups, "error": api_error})
 
 
-def _redirect_error(message: str) -> RedirectResponse:
-    # 简单地把错误经查询串带回首页展示（演示用途，避免引入消息中间件）
-    from urllib.parse import quote
-    return RedirectResponse(f"/?error={quote(message)}#top", status_code=303)
+def _redirect_error(message: str, path: str = "/") -> RedirectResponse:
+    # 简单地把错误经查询串带回页面展示（演示用途，避免引入消息中间件）
+    return RedirectResponse(f"{path}?error={quote(message)}#top", status_code=303)

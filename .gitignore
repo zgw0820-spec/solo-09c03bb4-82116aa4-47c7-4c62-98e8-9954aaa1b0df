@@ -8,6 +8,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.ruff_cache/
 
 # 本地试跑产物
 *.log
