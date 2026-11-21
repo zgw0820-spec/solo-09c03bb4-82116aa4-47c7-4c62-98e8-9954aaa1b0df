@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /srv
+COPY mock-k8s ./mock-k8s
+
+ENV PORT=8080 \
+    STATE_FILE=/data/mock-state.json \
+    NAMESPACE=previews
+EXPOSE 8080
+VOLUME ["/data"]
+
+# 演示参数（可在 compose 覆盖）：
+# DEFAULT_DELETE_DELAY  所有对象的默认删除延迟秒数
+# DELAY_FEATURE_A       指定分支的删除延迟，优先级更高
+CMD ["python", "-m", "mock-k8s.server"]

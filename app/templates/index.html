@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>预览环境清理控制台 · {{ namespace }}</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --text:#e2e8f0; --muted:#94a3b8;
+          --blue:#38bdf8; --red:#f87171; --amber:#fbbf24; --green:#4ade80; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+         background:var(--bg); color:var(--text); line-height:1.5; }
+  header { padding:20px 28px; border-bottom:1px solid var(--line); display:flex;
+           align-items:baseline; gap:16px; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:20px; }
+  header .meta { color:var(--muted); font-size:13px; }
+  main { padding:24px 28px; max-width:1180px; margin:0 auto; }
+  .error-banner { background:#7f1d1d; border:1px solid var(--red); color:#fecaca;
+                  padding:10px 14px; border-radius:8px; margin-bottom:18px; font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          margin-bottom:18px; overflow:hidden; }
+  .card h2 { margin:0; padding:14px 18px; font-size:16px; border-bottom:1px solid var(--line);
+             display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
+  .branch { color:var(--blue); font-family: ui-monospace, monospace; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:9px 18px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; }
+  td.mono, code { font-family: ui-monospace, Menlo, monospace; font-size:12px; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px;
+           border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+  .badge.confirmed { color:var(--blue); border-color:var(--blue); }
+  .badge.service_deleting, .badge.deployment_deleting { color:var(--amber); border-color:var(--amber); }
+  .badge.pending_review { color:var(--amber); border-color:var(--amber); background:#451a03; }
+  .badge.conflict { color:var(--red); border-color:var(--red); background:#450a0a; }
+  .badge.completed { color:var(--green); border-color:var(--green); }
+  .badge.terminating { color:var(--amber); border-color:var(--amber); }
+  .unpaired { color:var(--amber); }
+  form.inline { display:inline; }
+  button { background:var(--blue); color:#082f49; border:0; border-radius:7px; padding:7px 14px;
+           font-size:13px; font-weight:600; cursor:pointer; }
+  button.danger { background:var(--red); color:#450a0a; }
+  button.ghost { background:transparent; color:var(--text); border:1px solid var(--line); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .job { border-top:1px dashed var(--line); padding:12px 18px; }
+  .job-head { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:6px; }
+  .events { margin:8px 0 0; padding-left:18px; font-size:12.5px; color:var(--muted); }
+  .events li.error { color:var(--red); }
+  .events li.warn { color:var(--amber); }
+  .conflict-box { background:#450a0a; border:1px solid var(--red); border-radius:8px;
+                  padding:10px 14px; margin:8px 0; font-size:13px; }
+  .pending-box { background:#451a03; border:1px solid var(--amber); border-radius:8px;
+                 padding:10px 14px; margin:8px 0; font-size:13px; }
+  .muted { color:var(--muted); }
+  .hint { font-size:12px; color:var(--muted); margin-top:6px; }
+</style>
+</head>
+<body id="top">
+<header>
+  <h1>预览环境清理控制台</h1>
+  <span class="meta">命名空间 <code>{{ namespace }}</code> · 分支标签 <code>{{ branch_label }}</code></span>
+</header>
+<main>
+  {% if request.query_params.get("error") %}
+  <div class="error-banner">⚠ {{ request.query_params.get("error") }}</div>
+  {% endif %}
+  {% if api_error %}
+  <div class="error-banner">⚠ {{ api_error }}</div>
+  {% endif %}
+
+  {% if not groups %}
+  <p class="muted">命名空间内没有可展示的对象。</p>
+  {% endif %}
+
+  {% for g in groups %}
+  <div class="card" id="branch-{{ g.branch }}">
+    <h2>
+      <span>分支 <span class="branch">{{ g.branch }}</span>
+        {% if not g.paired %}<span class="badge unpaired">未成对</span>{% endif %}
+      </span>
+      {% if g.paired %}
+      <form class="inline" method="post" action="/confirm">
+        <input type="hidden" name="branch" value="{{ g.branch }}">
+        <input type="hidden" name="service_name" value="{{ g.service.name }}">
+        <input type="hidden" name="deployment_name" value="{{ g.deployment.name }}">
+        <button class="danger" type="submit">确认清理这一对</button>
+      </form>
+      {% endif %}
+    </h2>
+    <table>
+      <thead><tr><th>类型</th><th>名称</th><th>UID（确认基线）</th><th>分支标签</th><th>状态</th></tr></thead>
+      <tbody>
+      {% for o in [g.service, g.deployment] %}
+        <tr>
+          {% if o %}
+          <td>{{ o.kind }}</td>
+          <td class="mono">{{ o.name }}</td>
+          <td class="mono">{{ o.uid }}</td>
+          <td class="mono">{{ o.branch }}</td>
+          <td>
+            {% if o.terminating %}<span class="badge terminating">终止中 {{ o.deletionTimestamp }}</span>
+            {% else %}<span class="badge">存活</span>{% endif %}
+            {% if o.delay %}<span class="badge">删除延迟 {{ o.delay }}s</span>{% endif %}
+          </td>
+          {% else %}
+          <td colspan="5" class="unpaired">该分支缺少 {{ "Deployment" if loop.index0 == 1 else "Service" }}，不可确认清理</td>
+          {% endif %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    {% for job in g.jobs %}
+    <div class="job" id="job-{{ job.id }}">
+      <div class="job-head">
+        <span class="badge {{ job.phase }}">{{ job.phaseLabel }}</span>
+        <code>{{ job.id }}</code>
+        <span class="muted">更新于 {{ job.updatedAt }}</span>
+        <form class="inline" method="post" action="/jobs/{{ job.id }}/run">
+          <button type="submit"
+            {% if job.phase in ["conflict", "completed"] %}disabled{% endif %}>
+            沿清单复查并继续清理
+          </button>
+        </form>
+        {% if job.phase == "conflict" %}
+        <form class="inline" method="post" action="/jobs/{{ job.id }}/resolve">
+          <button class="ghost" type="submit">已知情：按当前对象刷新清单基线</button>
+        </form>
+        {% endif %}
+      </div>
+
+      {% if job.phase == "conflict" and job.conflict %}
+      <div class="conflict-box">
+        🛑 {{ job.conflict.detail }}<br>
+        变更项：<code>{{ job.conflict.kind }}/{{ job.conflict.name }}</code> 的
+        <strong>{{ "UID" if job.conflict.field == "uid" else "分支标签" }}</strong>
+        （期望 <code>{{ job.conflict.expected }}</code>，实际 <code>{{ job.conflict.actual }}</code>）。
+        本次清理已停止，未对该对象执行任何删除。
+      </div>
+      {% endif %}
+      {% if job.pendingReason %}
+      <div class="pending-box">⏳ {{ job.pendingReason }}</div>
+      {% endif %}
+
+      <table style="margin-top:8px">
+        <tr><th>清单基线</th><th>名称</th><th>UID</th><th>分支</th></tr>
+        <tr><td>Service</td><td class="mono">{{ job.service.name }}</td>
+            <td class="mono">{{ job.service.uid or "—（已消失）" }}</td>
+            <td class="mono">{{ job.service.branch or "—" }}</td></tr>
+        <tr><td>Deployment</td><td class="mono">{{ job.deployment.name }}</td>
+            <td class="mono">{{ job.deployment.uid or "—（已消失）" }}</td>
+            <td class="mono">{{ job.deployment.branch or "—" }}</td></tr>
+      </table>
+
+      <ul class="events">
+        {% for ev in job.events %}
+        <li class="{{ ev.level }}">{{ ev.at }} · {{ ev.message }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+
+  <p class="hint">
+    核对规则：删除受理前比对 UID 与分支标签；UID 变化判定为同名重建，标签变化判定为改属，任一不符即停止。
+    Deployment 仅在原 Service GET 返回 404 后才允许删除。删除超时或对象终止中显示“待核查”，状态已持久化，重启后可继续。
+  </p>
+</main>
+</body>
+</html>

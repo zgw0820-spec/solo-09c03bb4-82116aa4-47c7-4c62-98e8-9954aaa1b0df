@@ -1,0 +1,14 @@
+# 运行期数据
+data/
+*.json
+!requirements*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地试跑产物
+*.log
+.pytest_cache/
